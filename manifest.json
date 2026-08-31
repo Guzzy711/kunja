@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.guzzy711.kunja",
+  "name": "Kunja",
+  "version": "0.3.2",
+  "author": "Guzzy711",
+  "license": "MIT",
+  "description": "Watch, open, and create Vikunja tasks from the Omarchy bar.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Kunja",
+    "description": "A compact due-task status with overdue warnings and quick task creation.",
+    "category": "Productivity",
+    "aliases": [
+      "vikunja",
+      "tasks",
+      "todo"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshMinutes": 5,
+      "horizonDays": 14,
+      "reminderMinutes": 60,
+      "maxTasks": 50
+    },
+    "schema": [
+      {
+        "key": "refreshMinutes",
+        "type": "integer",
+        "label": "Refresh every",
+        "min": 1,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 5,
+        "description": "Minutes between Vikunja refreshes."
+      },
+      {
+        "key": "horizonDays",
+        "type": "integer",
+        "label": "Watch tasks due within",
+        "min": 1,
+        "max": 365,
+        "step": 1,
+        "defaultValue": 14,
+        "description": "Days ahead to include. Overdue tasks are always included."
+      },
+      {
+        "key": "reminderMinutes",
+        "type": "integer",
+        "label": "Remind before due",
+        "min": 0,
+        "max": 1440,
+        "step": 15,
+        "defaultValue": 60,
+        "description": "Minutes before a deadline. Use 0 to disable desktop reminders."
+      },
+      {
+        "key": "maxTasks",
+        "type": "integer",
+        "label": "Maximum tasks",
+        "min": 10,
+        "max": 200,
+        "step": 10,
+        "defaultValue": 50,
+        "description": "Maximum number of tasks kept in the panel."
+      }
+    ]
+  }
+}

@@ -1,0 +1,1054 @@
+#!/usr/bin/env python3
+"""Secure Vikunja integration helper for the Kunja Omarchy plugin."""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Callable, Iterable
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urlsplit
+from urllib.request import Request, urlopen
+
+
+SCHEMA_VERSION = 1
+EXAMPLE_ENDPOINT = "https://vikunja.example.com"
+KEYRING_SERVICE = "kunja"
+CONFIG_FILENAME = "config.json"
+CACHE_FILENAME = "tasks.json"
+REMINDER_FILENAME = "reminders.json"
+USER_AGENT = "Kunja/0.3.1"
+
+
+class KunjaError(Exception):
+    def __init__(self, kind: str, message: str, status: int | None = None):
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+        self.status = status
+
+
+@dataclass(frozen=True)
+class Credentials:
+    vikunja_token: str
+
+
+def config_root() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "kunja"
+
+
+def state_root() -> Path:
+    return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "kunja"
+
+
+def config_path() -> Path:
+    return config_root() / CONFIG_FILENAME
+
+
+def cache_path() -> Path:
+    return state_root() / CACHE_FILENAME
+
+
+def reminder_path() -> Path:
+    return state_root() / REMINDER_FILENAME
+
+
+def atomic_write_json(path: Path, value: Any, mode: int = 0o600) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    handle, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def read_json(path: Path, default: Any = None) -> Any:
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            return json.load(stream)
+    except (OSError, ValueError, TypeError):
+        return default
+
+
+def normalize_endpoint(value: str) -> str:
+    endpoint = value.strip().rstrip("/")
+    parsed = urlsplit(endpoint)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise KunjaError("invalid-config", "The Vikunja endpoint must be a plain HTTPS URL.")
+    if parsed.query or parsed.fragment:
+        raise KunjaError("invalid-config", "The Vikunja endpoint cannot contain a query or fragment.")
+    return endpoint
+
+
+def api_token_settings_url(endpoint: str) -> str:
+    return f"{normalize_endpoint(endpoint)}/user/settings/api-tokens"
+
+
+def prompt_endpoint(provided: str | None, input_fn: Callable[[str], str] = input) -> str:
+    if provided:
+        return normalize_endpoint(provided)
+
+    saved = read_json(config_path(), {})
+    default = str(saved.get("endpoint") or "").strip() if isinstance(saved, dict) else ""
+    try:
+        default = normalize_endpoint(default) if default else ""
+    except KunjaError:
+        default = ""
+
+    while True:
+        suffix = f" [{default}]" if default else ""
+        value = input_fn(f"Vikunja URL{suffix}: ").strip() or default
+        if not value:
+            print(f"Please enter the HTTPS address you use to open Vikunja, for example {EXAMPLE_ENDPOINT}.")
+            continue
+        try:
+            return normalize_endpoint(value)
+        except KunjaError as error:
+            print(f"That URL does not look right: {error.message}")
+
+
+def ask_yes_no(prompt: str, default: bool = True, input_fn: Callable[[str], str] = input) -> bool:
+    suffix = " [Y/n]: " if default else " [y/N]: "
+    while True:
+        answer = input_fn(prompt + suffix).strip().lower()
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        print("Please answer yes or no.")
+
+
+def open_browser(url: str, runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run) -> bool:
+    try:
+        result = runner(
+            ["xdg-open", url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
+def local_timezone_name() -> str:
+    configured = os.environ.get("TZ", "").strip()
+    if configured and not configured.startswith(":"):
+        return configured
+    try:
+        target = Path("/etc/localtime").resolve()
+        marker = "/zoneinfo/"
+        if marker in str(target):
+            return str(target).split(marker, 1)[1]
+    except OSError:
+        pass
+    return "UTC"
+
+
+def require_secret_tool() -> None:
+    if not shutil.which("secret-tool"):
+        raise KunjaError(
+            "missing-keyring",
+            "secret-tool is required to store Kunja credentials in the desktop keyring.",
+        )
+
+
+def secret_attributes(kind: str) -> list[str]:
+    return ["service", KEYRING_SERVICE, "kind", kind]
+
+
+def store_secret(kind: str, value: str, label: str) -> None:
+    require_secret_tool()
+    result = subprocess.run(
+        ["secret-tool", "store", f"--label={label}", *secret_attributes(kind)],
+        input=value,
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise KunjaError("keyring-error", result.stderr.strip() or f"Could not store {label}.")
+
+
+def lookup_secret(kind: str) -> str:
+    require_secret_tool()
+    result = subprocess.run(
+        ["secret-tool", "lookup", *secret_attributes(kind)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    value = result.stdout.rstrip("\n") if result.returncode == 0 else ""
+    if not value:
+        raise KunjaError(
+            "unconfigured",
+            "Kunja credentials are missing. Run the configure command from the panel.",
+        )
+    return value
+
+
+def clear_secret(kind: str) -> None:
+    if not shutil.which("secret-tool"):
+        return
+    subprocess.run(
+        ["secret-tool", "clear", *secret_attributes(kind)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+def load_credentials() -> Credentials:
+    return Credentials(vikunja_token=lookup_secret("vikunja-token"))
+
+
+def api_headers(credentials: Credentials) -> dict[str, str]:
+    return {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {credentials.vikunja_token}",
+        "User-Agent": USER_AGENT,
+    }
+
+
+def classify_http_error(status: int) -> KunjaError:
+    if status == 401:
+        return KunjaError("vikunja-auth", "Vikunja rejected the API token.", status)
+    if status == 403:
+        return KunjaError(
+            "vikunja-permission",
+            "The Vikunja API token does not have the permission needed for this action.",
+            status,
+        )
+    if status == 404:
+        return KunjaError("not-found", "The requested Vikunja API endpoint was not found.", status)
+    if status == 422:
+        return KunjaError("invalid-request", "Vikunja rejected the task details.", status)
+    return KunjaError("http-error", f"Vikunja returned HTTP {status}.", status)
+
+
+def request_json(
+    endpoint: str,
+    api_version: str,
+    path: str,
+    credentials: Credentials,
+    params: dict[str, Any] | None = None,
+    timeout: float = 12,
+    method: str = "GET",
+    body: dict[str, Any] | None = None,
+) -> tuple[Any, dict[str, str]]:
+    query = urlencode(params or {}, doseq=True)
+    url = f"{endpoint}/api/{api_version}/{path.lstrip('/')}"
+    if query:
+        url += "?" + query
+    headers = api_headers(credentials)
+    encoded = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    request = Request(url, data=encoded, headers=headers, method=method.upper())
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            response_headers = {key.lower(): value for key, value in response.headers.items()}
+    except HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        classified = classify_http_error(error.code)
+        if body.strip():
+            try:
+                detail = json.loads(body)
+                if isinstance(detail, dict):
+                    message = detail.get("message") or detail.get("detail") or detail.get("title")
+                    if message:
+                        classified = KunjaError(classified.kind, f"{classified.message} {message}", classified.status)
+            except ValueError:
+                pass
+        raise classified from error
+    except (URLError, TimeoutError, OSError) as error:
+        raise KunjaError("network", f"Could not reach Vikunja: {error.reason if isinstance(error, URLError) else error}") from error
+
+    if not raw.strip():
+        return {}, response_headers
+    content_type = response_headers.get("content-type", "")
+    if "text/html" in content_type.lower() or raw.lstrip().lower().startswith("<!doctype html"):
+        raise KunjaError("invalid-response", "Vikunja returned HTML instead of JSON.")
+    try:
+        return json.loads(raw), response_headers
+    except ValueError as error:
+        raise KunjaError("invalid-response", "Vikunja returned a non-JSON response.") from error
+
+
+Transport = Callable[[str, str, str, Credentials, dict[str, Any] | None], tuple[Any, dict[str, str]]]
+
+
+def detect_api_version(endpoint: str, credentials: Credentials, transport: Transport = request_json) -> str:
+    for candidate in ("v2", "v1"):
+        try:
+            payload, _ = transport(endpoint, candidate, "info", credentials, None)
+            if isinstance(payload, dict):
+                return candidate
+        except KunjaError as error:
+            if candidate == "v2" and error.status == 404:
+                continue
+            raise
+    raise KunjaError("unsupported-api", "This Vikunja instance exposes neither the v2 nor v1 API.")
+
+
+def page_items(payload: Any, api_version: str) -> tuple[list[dict[str, Any]], int | None]:
+    if api_version == "v2":
+        if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+            raise KunjaError("invalid-response", "Vikunja returned an invalid v2 list response.")
+        pages = payload.get("total_pages")
+        return [item for item in payload["items"] if isinstance(item, dict)], int(pages) if pages else None
+    if not isinstance(payload, list):
+        raise KunjaError("invalid-response", "Vikunja returned an invalid v1 list response.")
+    return [item for item in payload if isinstance(item, dict)], None
+
+
+def fetch_all_pages(
+    endpoint: str,
+    api_version: str,
+    path: str,
+    credentials: Credentials,
+    base_params: dict[str, Any],
+    transport: Transport = request_json,
+    maximum_pages: int = 100,
+) -> list[dict[str, Any]]:
+    collected: list[dict[str, Any]] = []
+    per_page = int(base_params.get("per_page", 100))
+    for page in range(1, maximum_pages + 1):
+        params = dict(base_params)
+        params["page"] = page
+        payload, headers = transport(endpoint, api_version, path, credentials, params)
+        items, body_pages = page_items(payload, api_version)
+        collected.extend(items)
+        header_pages = headers.get("x-pagination-total-pages")
+        total_pages = body_pages or (int(header_pages) if header_pages and header_pages.isdigit() else None)
+        if total_pages is not None and page >= total_pages:
+            break
+        if total_pages is None and len(items) < per_page:
+            break
+    return collected
+
+
+def parse_due_date(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text or text.startswith("0001-01-01") or text.startswith("0000-00-00"):
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def iso_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def due_state(due: datetime, now: datetime) -> str:
+    local_due = due.astimezone()
+    local_now = now.astimezone()
+    if due < now:
+        return "overdue"
+    if local_due.date() == local_now.date():
+        return "today"
+    return "upcoming"
+
+
+def relative_due(due: datetime, now: datetime) -> str:
+    seconds = int((due - now).total_seconds())
+    absolute = abs(seconds)
+    if seconds < 0:
+        if absolute < 3600:
+            return f"Overdue by {max(1, absolute // 60)}m"
+        if absolute < 86400:
+            return f"Overdue by {absolute // 3600}h"
+        return f"Overdue by {absolute // 86400}d"
+    if seconds < 3600:
+        return f"Due in {max(1, seconds // 60)}m"
+    if seconds < 86400:
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        return f"Due in {hours}h" + (f" {minutes}m" if minutes else "")
+    local_due = due.astimezone()
+    local_now = now.astimezone()
+    if local_due.date() == local_now.date() + timedelta(days=1):
+        return "Tomorrow " + local_due.strftime("%H:%M")
+    return local_due.strftime("%a %-d %b · %H:%M")
+
+
+def flatten_projects(projects: Iterable[dict[str, Any]]) -> dict[int, str]:
+    result: dict[int, str] = {}
+
+    def visit(project: dict[str, Any]) -> None:
+        try:
+            project_id = int(project.get("id", 0))
+        except (TypeError, ValueError):
+            project_id = 0
+        if project_id:
+            result[project_id] = str(project.get("title") or "Unknown project")
+        children = project.get("child_projects") or project.get("children") or []
+        if isinstance(children, list):
+            for child in children:
+                if isinstance(child, dict):
+                    visit(child)
+
+    for value in projects:
+        visit(value)
+    return result
+
+
+def normalize_task(
+    task: dict[str, Any],
+    projects: dict[int, str],
+    endpoint: str,
+    now: datetime,
+) -> dict[str, Any] | None:
+    due = parse_due_date(task.get("due_date"))
+    try:
+        task_id = int(task.get("id", 0))
+        project_id = int(task.get("project_id", task.get("project", 0)) or 0)
+        priority = int(task.get("priority", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if not task_id or due is None:
+        return None
+    labels = []
+    for label in task.get("labels") or []:
+        if isinstance(label, dict):
+            labels.append({
+                "title": str(label.get("title") or ""),
+                "hex_color": str(label.get("hex_color") or ""),
+            })
+    return {
+        "id": task_id,
+        "identifier": str(task.get("identifier") or f"#{task.get('index', task_id)}"),
+        "title": str(task.get("title") or "Untitled task"),
+        "project_id": project_id,
+        "project_title": projects.get(project_id, "Unknown project"),
+        "due_at": iso_utc(due),
+        "due_state": due_state(due, now),
+        "relative_due": relative_due(due, now),
+        "priority": max(0, priority),
+        "labels": labels,
+        "frontend_url": f"{endpoint}/tasks/{task_id}",
+    }
+
+
+def fetch_document(
+    config: dict[str, Any],
+    credentials: Credentials,
+    horizon_days: int,
+    max_tasks: int,
+    now: datetime | None = None,
+    transport: Transport = request_json,
+) -> dict[str, Any]:
+    current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    endpoint = normalize_endpoint(str(config["endpoint"]))
+    api_version = str(config["api_version"])
+    timezone_name = str(config.get("timezone") or local_timezone_name())
+
+    # v1 resolves currentUser inside the API filter. v2 requires the
+    # authenticated username, which is available with read-only access.
+    assignee_filter = "assignees in currentUser"
+    if api_version == "v2":
+        user_payload, _ = transport(endpoint, api_version, "user", credentials, None)
+        username = str(user_payload.get("username") or "").replace('"', '\\"') if isinstance(user_payload, dict) else ""
+        if not username:
+            raise KunjaError("invalid-response", "Vikunja returned no authenticated username.")
+        assignee_filter = f'assignees in "{username}"'
+    task_filter = f"done = false && {assignee_filter} && due_date < now+{horizon_days}d"
+    sort_by: Any = "due_date,priority"
+    order_by: Any = "asc,desc"
+    if api_version == "v2":
+        # v2 treats comma-separated order values as one invalid value; send
+        # repeated query parameters instead.
+        sort_by = ["due_date", "priority"]
+        order_by = ["asc", "desc"]
+    tasks = fetch_all_pages(
+        endpoint,
+        api_version,
+        "tasks",
+        credentials,
+        {
+            "filter": task_filter,
+            "filter_include_nulls": "false",
+            "filter_timezone": timezone_name,
+            "sort_by": sort_by,
+            "order_by": order_by,
+            "per_page": 100,
+        },
+        transport,
+    )
+    projects_payload = fetch_all_pages(
+        endpoint, api_version, "projects", credentials, {"per_page": 100}, transport
+    )
+    project_map = flatten_projects(projects_payload)
+    horizon = current_time + timedelta(days=horizon_days)
+    normalized = []
+    for task in tasks:
+        due = parse_due_date(task.get("due_date"))
+        if task.get("done") is True or due is None or due >= horizon:
+            continue
+        value = normalize_task(task, project_map, endpoint, current_time)
+        if value:
+            normalized.append(value)
+    normalized.sort(key=lambda task: (task["due_at"], -int(task["priority"]), task["title"].casefold()))
+    task_count = len(normalized)
+    visible = normalized[:max_tasks]
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "ok",
+        "fetched_at": iso_utc(current_time),
+        "api_version": api_version,
+        "endpoint": endpoint,
+        "task_count": task_count,
+        "overdue_count": sum(1 for task in normalized if task["due_state"] == "overdue"),
+        "tasks": visible,
+        "error": {"kind": "", "message": ""},
+    }
+
+
+def require_v2(config: dict[str, Any]) -> tuple[str, str]:
+    endpoint = normalize_endpoint(str(config["endpoint"]))
+    api_version = str(config.get("api_version") or "")
+    if api_version != "v2":
+        raise KunjaError(
+            "unsupported-api",
+            "Creating tasks from Kunja requires Vikunja API v2.",
+        )
+    return endpoint, api_version
+
+
+def project_create_options(projects: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    options: list[dict[str, Any]] = []
+
+    def visit(project: dict[str, Any], parents: list[str]) -> None:
+        title = str(project.get("title") or "Untitled project").strip()
+        try:
+            project_id = int(project.get("id", 0))
+            permission = int(project.get("max_permission", -1))
+        except (TypeError, ValueError):
+            project_id = 0
+            permission = -1
+        path = [*parents, title]
+        if project_id > 0 and permission >= 1 and project.get("is_archived") is not True:
+            options.append({
+                "id": project_id,
+                "title": title,
+                "label": " / ".join(path),
+            })
+        children = project.get("child_projects") or project.get("children") or []
+        if isinstance(children, list):
+            for child in children:
+                if isinstance(child, dict):
+                    visit(child, path)
+
+    for project in projects:
+        if isinstance(project, dict):
+            visit(project, [])
+    options.sort(key=lambda item: item["label"].casefold())
+    return options
+
+
+def normalize_user_option(user: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        user_id = int(user.get("id", 0))
+    except (TypeError, ValueError):
+        return None
+    username = str(user.get("username") or "").strip()
+    if user_id <= 0 or not username:
+        return None
+    name = str(user.get("name") or "").strip()
+    return {
+        "id": user_id,
+        "username": username,
+        "name": name,
+        "label": f"{name} (@{username})" if name and name != username else f"@{username}",
+    }
+
+
+def fetch_create_options(
+    config: dict[str, Any],
+    credentials: Credentials,
+    transport: Transport = request_json,
+) -> dict[str, Any]:
+    endpoint, api_version = require_v2(config)
+    user_payload, _ = transport(endpoint, api_version, "user", credentials, None)
+    current_user = normalize_user_option(user_payload) if isinstance(user_payload, dict) else None
+    if current_user is None:
+        raise KunjaError("invalid-response", "Vikunja returned no authenticated user details.")
+    projects = fetch_all_pages(
+        endpoint,
+        api_version,
+        "projects",
+        credentials,
+        {"expand": "permissions", "per_page": 100},
+        transport,
+    )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "ok",
+        "current_user": current_user,
+        "projects": project_create_options(projects),
+        "error": {"kind": "", "message": ""},
+    }
+
+
+def fetch_project_users(
+    config: dict[str, Any],
+    credentials: Credentials,
+    project_id: int,
+    transport: Transport = request_json,
+) -> dict[str, Any]:
+    if project_id <= 0:
+        raise KunjaError("invalid-config", "Choose a valid Vikunja project.")
+    endpoint, api_version = require_v2(config)
+    payload, _ = transport(
+        endpoint,
+        api_version,
+        f"projects/{project_id}/users/search",
+        credentials,
+        None,
+    )
+    users, _ = page_items(payload, api_version)
+    normalized = [value for user in users if (value := normalize_user_option(user)) is not None]
+    normalized.sort(key=lambda item: (item["name"] or item["username"]).casefold())
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "ok",
+        "project_id": project_id,
+        "users": normalized,
+        "error": {"kind": "", "message": ""},
+    }
+
+
+WriteTransport = Callable[..., tuple[Any, dict[str, str]]]
+
+
+def validate_create_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise KunjaError("invalid-config", "The task details must be a JSON object.")
+    title = str(payload.get("title") or "").strip()
+    description = str(payload.get("description") or "").strip()
+    assignee_label = str(payload.get("assignee_label") or "").strip()[:250]
+    try:
+        project_id = int(payload.get("project_id", 0))
+        priority = int(payload.get("priority", 0))
+    except (TypeError, ValueError) as error:
+        raise KunjaError("invalid-config", "Project and priority must be valid numbers.") from error
+    assignee_value = payload.get("assignee_id")
+    try:
+        assignee_id = int(assignee_value) if assignee_value not in (None, "", 0, "0") else None
+    except (TypeError, ValueError) as error:
+        raise KunjaError("invalid-config", "Choose a valid assignee.") from error
+    due = parse_due_date(payload.get("due_date", payload.get("due_at")))
+    if not title:
+        raise KunjaError("invalid-config", "Task title is required.")
+    if project_id <= 0:
+        raise KunjaError("invalid-config", "Project is required.")
+    if due is None:
+        raise KunjaError("invalid-config", "A valid due date and time is required.")
+    if priority < 0 or priority > 5:
+        raise KunjaError("invalid-config", "Priority must be between 0 and 5.")
+    if assignee_id is not None and assignee_id <= 0:
+        raise KunjaError("invalid-config", "Choose a valid assignee.")
+    return {
+        "title": title,
+        "description": description,
+        "project_id": project_id,
+        "assignee_id": assignee_id,
+        "assignee_label": assignee_label or ("Unassigned" if assignee_id is None else "Selected user"),
+        "due_date": iso_utc(due),
+        "priority": priority,
+    }
+
+
+def create_task_document(
+    config: dict[str, Any],
+    credentials: Credentials,
+    raw_payload: Any,
+    transport: WriteTransport = request_json,
+) -> dict[str, Any]:
+    endpoint, api_version = require_v2(config)
+    payload = validate_create_payload(raw_payload)
+    created, _ = transport(
+        endpoint,
+        api_version,
+        f"projects/{payload['project_id']}/tasks",
+        credentials,
+        {"format": "markdown"},
+        method="POST",
+        body={
+            "title": payload["title"],
+            "description": payload["description"],
+            "due_date": payload["due_date"],
+            "priority": payload["priority"],
+        },
+    )
+    if not isinstance(created, dict):
+        raise KunjaError("invalid-response", "Vikunja returned an invalid created task.")
+    try:
+        task_id = int(created.get("id", 0))
+    except (TypeError, ValueError):
+        task_id = 0
+    if task_id <= 0:
+        raise KunjaError("invalid-response", "Vikunja returned no id for the created task.")
+    task = {
+        "id": task_id,
+        "identifier": str(created.get("identifier") or f"#{task_id}"),
+        "title": str(created.get("title") or payload["title"]),
+        "frontend_url": f"{endpoint}/tasks/{task_id}",
+        "assignee_id": payload["assignee_id"],
+        "assignee_label": payload["assignee_label"],
+    }
+    assignee_id = payload["assignee_id"]
+    assignees = [] if assignee_id is None else [{"id": assignee_id}]
+    try:
+        transport(
+            endpoint,
+            api_version,
+            f"tasks/{task_id}/assignees/bulk",
+            credentials,
+            None,
+            method="PUT",
+            body={"assignees": assignees},
+        )
+    except KunjaError as error:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "status": "partial",
+            "task": task,
+            "message": f"Task created, but its assignee selection could not be applied. {error.message}",
+            "error": {"kind": error.kind, "message": error.message},
+        }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "ok",
+        "task": task,
+        "message": "Task created successfully.",
+        "error": {"kind": "", "message": ""},
+    }
+
+
+def error_document(error: KunjaError, cached: dict[str, Any] | None = None) -> dict[str, Any]:
+    if (
+        error.kind != "unconfigured"
+        and cached
+        and cached.get("schema_version") == SCHEMA_VERSION
+        and isinstance(cached.get("tasks"), list)
+    ):
+        result = dict(cached)
+        result["status"] = "stale"
+        result["error"] = {"kind": error.kind, "message": error.message}
+        return result
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "unconfigured" if error.kind == "unconfigured" else "error",
+        "fetched_at": "",
+        "api_version": "",
+        "endpoint": "",
+        "task_count": 0,
+        "overdue_count": 0,
+        "tasks": [],
+        "error": {"kind": error.kind, "message": error.message},
+    }
+
+
+def reminder_key(task: dict[str, Any]) -> str:
+    return f"{int(task['id'])}:{task['due_at']}"
+
+
+def notification_command(task: dict[str, Any]) -> list[str]:
+    url = str(task["frontend_url"])
+    click_command = "xdg-open " + shlex.quote(url)
+    description = f"{task['project_title']} · {task['relative_due']}"
+    return [
+        "omarchy-notification-send",
+        "--app-name", "Kunja",
+        "--glyph", "󰄬",
+        "--urgency", "normal",
+        "--exec", click_command,
+        str(task["title"]),
+        description,
+    ]
+
+
+def send_due_notifications(
+    tasks: Iterable[dict[str, Any]],
+    reminder_minutes: int,
+    now: datetime | None = None,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> int:
+    if reminder_minutes <= 0:
+        return 0
+    current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    state = read_json(reminder_path(), {"schema_version": SCHEMA_VERSION, "sent": {}})
+    sent = state.get("sent") if isinstance(state, dict) else {}
+    if not isinstance(sent, dict):
+        sent = {}
+    active_keys = {reminder_key(task) for task in tasks}
+    cutoff = current_time - timedelta(days=30)
+    retained: dict[str, str] = {}
+    for key, value in sent.items():
+        stamp = parse_due_date(value)
+        if key in active_keys or (stamp is not None and stamp >= cutoff):
+            retained[str(key)] = str(value)
+
+    notification_count = 0
+    lead_seconds = reminder_minutes * 60
+    for task in tasks:
+        due = parse_due_date(task.get("due_at"))
+        key = reminder_key(task)
+        if due is None or key in retained:
+            continue
+        seconds = (due - current_time).total_seconds()
+        if seconds <= 0 or seconds > lead_seconds:
+            continue
+        try:
+            result = runner(
+                notification_command(task),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            # A missing or temporarily unavailable notification command must
+            # not take the task watcher down. Leave the key unsent so a later
+            # refresh can retry it.
+            continue
+        if result.returncode == 0:
+            retained[key] = iso_utc(current_time)
+            notification_count += 1
+    atomic_write_json(reminder_path(), {"schema_version": SCHEMA_VERSION, "sent": retained})
+    return notification_count
+
+
+def load_config() -> dict[str, Any]:
+    value = read_json(config_path())
+    if not isinstance(value, dict) or not value.get("endpoint") or value.get("api_version") not in ("v1", "v2"):
+        raise KunjaError(
+            "unconfigured",
+            "Kunja is not configured. Run the configure command from the panel.",
+        )
+    return value
+
+
+def print_command_document(document: dict[str, Any], compact: bool) -> None:
+    if compact:
+        json.dump(document, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+    else:
+        json.dump(document, sys.stdout, ensure_ascii=False, indent=2)
+    sys.stdout.write("\n")
+
+
+def command_error_document(error: KunjaError) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "error",
+        "error": {"kind": error.kind, "message": error.message},
+    }
+
+
+def create_options_command(args: argparse.Namespace) -> int:
+    try:
+        document = fetch_create_options(load_config(), load_credentials())
+        exit_code = 0
+    except KunjaError as error:
+        document = command_error_document(error)
+        exit_code = 1
+    print_command_document(document, args.json)
+    return exit_code
+
+
+def project_users_command(args: argparse.Namespace) -> int:
+    try:
+        document = fetch_project_users(load_config(), load_credentials(), args.project_id)
+        exit_code = 0
+    except KunjaError as error:
+        document = command_error_document(error)
+        exit_code = 1
+    print_command_document(document, args.json)
+    return exit_code
+
+
+def create_task_command(args: argparse.Namespace) -> int:
+    try:
+        raw = sys.stdin.readline(65537)
+        if len(raw) > 65536:
+            raise KunjaError("invalid-config", "Task details are too large.")
+        try:
+            payload = json.loads(raw)
+        except ValueError as error:
+            raise KunjaError("invalid-config", "Task details are not valid JSON.") from error
+        document = create_task_document(load_config(), load_credentials(), payload)
+        exit_code = 2 if document["status"] == "partial" else 0
+    except KunjaError as error:
+        document = command_error_document(error)
+        exit_code = 1
+    print_command_document(document, args.json)
+    return exit_code
+
+
+def configure(args: argparse.Namespace) -> int:
+    require_secret_tool()
+    print("\nKunja setup")
+    print("-----------")
+    print("Connect your Omarchy bar to Vikunja in two short steps.")
+    print("Your API token is stored in the desktop keyring, not in Kunja's config file.\n")
+
+    print("1 of 2 — Vikunja address")
+    print(f"Enter the address you normally use to open Vikunja (for example {EXAMPLE_ENDPOINT}).")
+    endpoint = prompt_endpoint(args.endpoint)
+    print(f"Using {endpoint}\n")
+
+    print("2 of 2 — Scoped API token")
+    print("Create a token named 'Kunja' with these permissions:")
+    print("  • Tasks → Read All, Create")
+    print("  • Projects → Read All, Users Search")
+    print("  • Tasks Assignees → Create")
+    print("Vikunja shows a new token only once, so copy it before closing the page.")
+    token_url = api_token_settings_url(endpoint)
+    if not args.no_open_browser and ask_yes_no("Open Vikunja's API token settings in your browser?"):
+        if open_browser(token_url):
+            print("Opened the API token settings page.")
+        else:
+            print("Could not open a browser automatically.")
+            print(f"Open this page yourself: {token_url}")
+    else:
+        print(f"API token settings: {token_url}")
+
+    vikunja_token = getpass.getpass("\nPaste API token (input hidden): ").strip()
+    if not vikunja_token:
+        raise KunjaError("invalid-config", "The Vikunja API token is required.")
+    credentials = Credentials(vikunja_token)
+    print("\nChecking the connection…")
+    api_version = detect_api_version(endpoint, credentials)
+    candidate = {
+        "schema_version": SCHEMA_VERSION,
+        "endpoint": endpoint,
+        "api_version": api_version,
+        "timezone": local_timezone_name(),
+    }
+    fetch_document(candidate, credentials, horizon_days=14, max_tasks=1)
+    store_secret("vikunja-token", vikunja_token, "Kunja Vikunja API token")
+    atomic_write_json(config_path(), candidate)
+    print(f"\n✓ Kunja is connected using Vikunja API {api_version}.")
+    print("Refresh the widget with a middle click, or wait for its next refresh.")
+    return 0
+
+
+def sync(args: argparse.Namespace) -> int:
+    try:
+        config = load_config()
+        credentials = load_credentials()
+        document = fetch_document(
+            config,
+            credentials,
+            horizon_days=max(1, min(365, args.horizon_days)),
+            max_tasks=max(10, min(200, args.max_tasks)),
+        )
+        atomic_write_json(cache_path(), document)
+        if args.notify:
+            send_due_notifications(document["tasks"], max(0, min(1440, args.reminder_minutes)))
+        exit_code = 0
+    except KunjaError as error:
+        document = error_document(error, read_json(cache_path()))
+        exit_code = 1
+    if args.json:
+        json.dump(document, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+        sys.stdout.write("\n")
+    else:
+        print(json.dumps(document, ensure_ascii=False, indent=2))
+    return exit_code
+
+
+def clear_credentials(_: argparse.Namespace) -> int:
+    clear_secret("vikunja-token")
+    try:
+        config_path().unlink()
+    except FileNotFoundError:
+        pass
+    print("Removed Kunja credentials and connection configuration.")
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(description=__doc__)
+    commands = root.add_subparsers(dest="command", required=True)
+    configure_parser = commands.add_parser("configure", help="connect Vikunja and securely store credentials")
+    configure_parser.add_argument(
+        "--endpoint",
+        help="Vikunja HTTPS URL (skips the interactive URL prompt)",
+    )
+    configure_parser.add_argument(
+        "--no-open-browser",
+        action="store_true",
+        help="show the API token settings URL without offering to open it",
+    )
+    configure_parser.set_defaults(handler=configure)
+    sync_parser = commands.add_parser("sync", help="fetch and normalize watched tasks")
+    sync_parser.add_argument("--json", action="store_true", help="emit compact JSON")
+    sync_parser.add_argument("--notify", action="store_true", help="send eligible due-soon notifications")
+    sync_parser.add_argument("--horizon-days", type=int, default=14)
+    sync_parser.add_argument("--reminder-minutes", type=int, default=60)
+    sync_parser.add_argument("--max-tasks", type=int, default=50)
+    sync_parser.set_defaults(handler=sync)
+    options_parser = commands.add_parser("create-options", help="list writable projects for task creation")
+    options_parser.add_argument("--json", action="store_true", help="emit compact JSON")
+    options_parser.set_defaults(handler=create_options_command)
+    users_parser = commands.add_parser("project-users", help="list users assignable in a project")
+    users_parser.add_argument("--project-id", type=int, required=True)
+    users_parser.add_argument("--json", action="store_true", help="emit compact JSON")
+    users_parser.set_defaults(handler=project_users_command)
+    create_parser = commands.add_parser("create-task", help="create a Vikunja task from JSON on stdin")
+    create_parser.add_argument("--json", action="store_true", help="emit compact JSON")
+    create_parser.set_defaults(handler=create_task_command)
+    clear_parser = commands.add_parser("clear-credentials", help="remove secrets from the desktop keyring")
+    clear_parser.set_defaults(handler=clear_credentials)
+    return root
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        return int(args.handler(args))
+    except KunjaError as error:
+        print(f"kunja: {error.message}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nkunja: cancelled", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
