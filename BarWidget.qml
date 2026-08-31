@@ -19,6 +19,7 @@ BarWidget {
   readonly property string compactIcon: Model.barIcon(taskDocument)
   readonly property string compactTitle: Model.barTitle(taskDocument)
   readonly property string compactBadge: Model.barBadge(taskDocument)
+  readonly property bool showTaskTitle: setting("showTaskTitle", true) === true
 
   readonly property bool opened: panelLoader.item
     ? panelLoader.item.opened === true : false
@@ -29,6 +30,14 @@ BarWidget {
   function close() { if (panelLoader.item) panelLoader.item.close() }
   function toggle() { if (panelLoader.item) panelLoader.item.toggle() }
   function refresh() { if (taskService) taskService.refresh() }
+  function toggleShowTaskTitle() {
+    var entry = { id: root.moduleName }
+    for (var key in root.settings) if (key !== "id") entry[key] = root.settings[key]
+    entry.showTaskTitle = !root.showTaskTitle
+    root.settings = entry
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
+      root.bar.shell.updateEntryInline(root.moduleName, entry)
+  }
   function closeForPopoutSwitch() {
     if (panelLoader.item) panelLoader.item.closeForPopoutSwitch()
   }
@@ -99,46 +108,79 @@ BarWidget {
       anchors.centerIn: parent
       spacing: Style.space(7)
 
-      Text {
-        anchors.verticalCenter: parent.verticalCenter
-        text: root.compactIcon
-        color: root.hasWarning ? button.activeColor : button.foreground
-        font.family: button.fontFamily
-        font.pixelSize: Style.font.body
-        renderType: Text.NativeRendering
+      Rectangle {
+        id: iconChip
+        visible: root.vertical
+        width: Style.space(24)
+        height: width
+        radius: width / 2
+        color: root.hasWarning
+          ? Util.alpha(button.activeColor, 0.18)
+          : Util.alpha(button.foreground, 0.10)
+
+        Text {
+          anchors.centerIn: parent
+          text: root.compactIcon
+          color: root.hasWarning ? button.activeColor : button.foreground
+          font.family: button.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          renderType: Text.NativeRendering
+        }
+      }
+
+      Rectangle {
+        id: statusPill
+        visible: !root.vertical
+        implicitWidth: statusContent.implicitWidth + Style.space(16)
+        width: implicitWidth
+        height: Style.space(26)
+        radius: height / 2
+        color: root.hasOverdue
+          ? Util.alpha(button.activeColor, 0.20)
+          : Util.alpha(button.foreground, 0.10)
+        border.width: 1
+        border.color: root.hasOverdue
+          ? Util.alpha(button.activeColor, 0.45)
+          : Util.alpha(button.foreground, 0.16)
+
+        Row {
+          id: statusContent
+          anchors.centerIn: parent
+          spacing: Style.space(5)
+
+          Text {
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.compactIcon
+            color: root.hasWarning ? button.activeColor : button.foreground
+            font.family: button.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            renderType: Text.NativeRendering
+          }
+
+          Text {
+            visible: root.compactBadge !== ""
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.compactBadge
+            color: root.hasOverdue ? button.activeColor : button.foreground
+            font.family: button.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: root.hasOverdue
+            renderType: Text.NativeRendering
+          }
+        }
       }
 
       Text {
-        visible: !root.vertical
+        visible: !root.vertical && root.showTaskTitle
         anchors.verticalCenter: parent.verticalCenter
         text: root.compactTitle
         color: button.foreground
         font.family: button.fontFamily
         font.pixelSize: Style.font.bodySmall
+        font.weight: Font.Medium
         renderType: Text.NativeRendering
       }
 
-      Rectangle {
-        visible: !root.vertical && root.compactBadge !== ""
-        anchors.verticalCenter: parent.verticalCenter
-        width: badgeLabel.implicitWidth + Style.space(10)
-        height: badgeLabel.implicitHeight + Style.space(4)
-        radius: Math.min(height / 2, Style.cornerRadius)
-        color: root.hasOverdue
-          ? Util.alpha(button.activeColor, 0.16)
-          : Util.alpha(button.foreground, 0.08)
-
-        Text {
-          id: badgeLabel
-          anchors.centerIn: parent
-          text: root.compactBadge
-          color: root.hasOverdue ? button.activeColor : Qt.darker(button.foreground, 1.25)
-          font.family: button.fontFamily
-          font.pixelSize: Style.font.caption
-          font.bold: root.hasOverdue
-          renderType: Text.NativeRendering
-        }
-      }
     }
   }
 }

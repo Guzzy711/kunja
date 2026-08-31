@@ -17,6 +17,7 @@ Panel {
   property var hostWidget: null
   property var service: null
   readonly property var barIdentity: hostWidget || root
+  readonly property bool showTaskTitle: hostWidget ? hostWidget.showTaskTitle : true
   readonly property var document: service ? service.document : Model.parseSync("")
   readonly property var tasks: service ? service.tasks : []
   readonly property var rows: Model.panelRows(tasks)
@@ -166,6 +167,11 @@ Panel {
   function launchConfigure() {
     if (!service || service.helperPath === "") return
     Quickshell.execDetached(["xdg-terminal-exec", "python3", service.helperPath, "configure"])
+  }
+
+  function toggleShowTaskTitle() {
+    if (hostWidget && typeof hostWidget.toggleShowTaskTitle === "function")
+      hostWidget.toggleShowTaskTitle()
   }
 
   onTasksChanged: {
@@ -723,7 +729,7 @@ Panel {
           spacing: Style.space(10)
 
           Text {
-            width: parent.width - newTaskButton.width - refreshButton.width - parent.spacing * 2
+            width: parent.width - newTaskButton.width - titleToggleButton.width - refreshButton.width - parent.spacing * 3
             anchors.verticalCenter: parent.verticalCenter
             text: root.document.fetched_at
               ? "Updated " + Qt.formatDateTime(new Date(root.document.fetched_at), "HH:mm")
@@ -747,6 +753,15 @@ Panel {
             focusable: true
             enabled: root.service && !root.service.loading
             onClicked: root.startCreate()
+          }
+
+          PanelActionButton {
+            id: titleToggleButton
+            iconText: root.showTaskTitle ? "󰈈" : "󰈉"
+            tooltipText: root.showTaskTitle ? "Hide task title" : "Show task title"
+            foreground: root.foreground
+            enabled: root.hostWidget !== null
+            onClicked: root.toggleShowTaskTitle()
           }
 
           PanelActionButton {

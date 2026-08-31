@@ -78,4 +78,11 @@ TestCase {
     compare(Model.safeHttpsUrl("javascript:alert(1)"), "")
     compare(Model.safeHttpsUrl("https://example.test/a b"), "")
   }
+
+  function test_barTitleCanBeHiddenWithoutChangingTaskData() {
+    var source = document([task(1, "Ship release", "today")])
+    compare(Model.barIcon(source), "󰄬")
+    compare(Model.barBadge(source), "1")
+    compare(Model.barTitle(source), "Ship release")
+  }
 }

@@ -29,7 +29,8 @@
       "refreshMinutes": 5,
       "horizonDays": 14,
       "reminderMinutes": 60,
-      "maxTasks": 50
+      "maxTasks": 50,
+      "showTaskTitle": true
     },
     "schema": [
       {
@@ -71,6 +72,13 @@
         "step": 10,
         "defaultValue": 50,
         "description": "Maximum number of tasks kept in the panel."
+      },
+      {
+        "key": "showTaskTitle",
+        "type": "boolean",
+        "label": "Show task title",
+        "defaultValue": true,
+        "description": "Display the next task title in the bar."
       }
     ]
   }
